@@ -1,104 +1,161 @@
-/* -------------------------------------------------------------------------
- * Player.tsx – Link + déplacements + attaques “une seule fois”
- * ---------------------------------------------------------------------- */
+/* Player.tsx – checkpoints colorés et respawn
+ * ------------------------------------------------------------------ */
 
 import { useRef, useState, useEffect } from 'react'
-import { Group } from 'three'
+import { Group, Vector3 } from 'three'
 import * as THREE from 'three'
 import { useFrame, useThree } from '@react-three/fiber'
 import { useGLTF, useAnimations } from '@react-three/drei'
 
 import { useKeyboard } from '../hooks/useKeyboard'
 import { useMouseAttacks, Attack } from '../hooks/useMouseAttacks'
+import { CHECKPOINTS } from '../constants/checkpoints'
+import { useCheckpoint } from '../stores/useCheckpoints'
 
-/* --- Constantes ------------------------------------------------------------------ */
-const SPEED = 0.05
-const FRUSTUM_SIZE = 12      // même valeur que dans le projet vanilla
+const SPEED = 8
+const JUMP_HEIGHT = 2
+const GRAVITY = 12
+const FRUSTUM_SIZE = 12
+const HALF_W = 30
+const HALF_D = 10
+const FALL_Y_END = -5
+const CP_RADIUS = 2
 
-/* --- Déplacements clavier  ------------------------------------------------------- */
-function dirFromKeys(keys: ReturnType<typeof useKeyboard>) {
+function dir(keys: ReturnType<typeof useKeyboard>) {
   let dx = 0, dz = 0
-  if (keys.z || keys.ArrowUp)    dz -= 1
-  if (keys.s || keys.ArrowDown)  dz += 1
-  if (keys.q || keys.ArrowLeft)  dx -= 1
+  if (keys.z || keys.ArrowUp) dz -= 1
+  if (keys.s || keys.ArrowDown) dz += 1
+  if (keys.q || keys.ArrowLeft) dx -= 1
   if (keys.d || keys.ArrowRight) dx += 1
   return { dx, dz, moving: dx !== 0 || dz !== 0 }
 }
 
-/* ================================================================================
- *  Composant principal
- * ============================================================================ */
 export default function Player() {
-  /* ---------- Chargement du modèle GLTF & animations ---------- */
   const group = useRef<Group>(null!)
   const { scene, animations } = useGLTF('/character.glb')
   const { actions, mixer } = useAnimations(animations, group)
 
-  /* ---------- État d’input / animation actuelle ---------- */
-  const keys                       = useKeyboard()
-  const [attack, setAttack]        = useMouseAttacks()     // clic souris
-  const [current, setCurrent]      = useState<'idle' | 'run' | Attack>('idle')
+  /* état global checkpoint */
+  const currentCP = useCheckpoint((s) => s.current)
+  const setCurrentCP = useCheckpoint((s) => s.setCurrent)
 
-  /* ---------- Prépare toutes les animations d’attaque une fois au mount ---------- */
+  const keys = useKeyboard()
+  const [attack, setAttack] = useMouseAttacks()
+  const [jump, setJump] = useState(false)
+  const [fall, setFall] = useState(false)
+
+  type Anim = 'idle' | 'run' | 'jump' | 'fall' | Attack
+  const [current, setCurrent] = useState<Anim>('idle')
+
+  const jumpMeta = useRef<{ start: number; duration: number } | null>(null)
+  const respawnPos = useRef(new Vector3(...CHECKPOINTS[currentCP]))
+
+  /* clips LoopOnce */
   useEffect(() => {
     if (!actions) return
-    ;['attack1', 'attack4'].forEach(name => {
-      const a = actions[name]
+    ;['attack1', 'attack4', 'jump', 'fall'].forEach((n) => {
+      const a = actions[n]
       if (a) {
+        a.setLoop(THREE.LoopOnce, 1)
         a.clampWhenFinished = true
-        a.setLoop(THREE.LoopOnce, 1)       // ✅ joue exactement 1 fois
       }
     })
   }, [actions])
 
-  /* ---------- Fonction utilitaire pour fondre entre deux actions ---------- */
-  const fadeTo = (name: keyof typeof actions, duration = 0.2) => {
+  const fadeTo = (name: keyof typeof actions, d = 0.2) => {
     if (!actions || !actions[name] || current === name) return
-    actions[current!]?.fadeOut(duration)
-    actions[name]!.reset().fadeIn(duration).play()
-    setCurrent(name as any)
+    actions[current!]?.fadeOut(d)
+    actions[name]!.reset().fadeIn(d).play()
+    setCurrent(name as Anim)
   }
 
-  /* ---------- Déclenche l’attaque (et son retour à l’idle) ---------- */
+  /* input saut */
   useEffect(() => {
-    if (!attack) return                                   // aucune attaque à jouer
-    const action = actions[attack]
-    if (!action) return
+    const down = (e: KeyboardEvent) =>
+      e.code === 'Space' && !jump && !attack && !fall && setJump(true)
+    window.addEventListener('keydown', down)
+    return () => window.removeEventListener('keydown', down)
+  }, [jump, attack, fall])
 
-    fadeTo(attack)                                        // joue l’attaque
+  useEffect(() => {
+    if (!jump) return
+    const clip = actions['jump']; if (!clip) return
+    fadeTo('jump')
+    jumpMeta.current = { start: performance.now(), duration: clip.getClip().duration }
+    const end = () => { setJump(false); jumpMeta.current = null }
+    mixer.addEventListener('finished', end)
+    return () => mixer.removeEventListener('finished', end)
+  }, [jump, actions, mixer])
 
-    const onFinished = () => {
-      setAttack(null)                                     // réarme le hook
-      fadeTo('idle')                                      // retourne à l'idle
-      mixer.removeEventListener('finished', onFinished)   // nettoie
-    }
+  /* attaques */
+  useEffect(() => {
+    if (!attack) return
+    const a = actions[attack]; if (!a) return
+    fadeTo(attack)
+    const end = () => setAttack(null)
+    mixer.addEventListener('finished', end)
+    return () => mixer.removeEventListener('finished', end)
+  }, [attack, actions, mixer, setAttack])
 
-    mixer.addEventListener('finished', onFinished)
+  /* respawn */
+  const respawn = () => {
+    group.current.position.copy(respawnPos.current)
+    setFall(false)
+    fadeTo('idle', 0.1)
+  }
 
-    // Nettoyage si le composant démonte ou si une autre attaque remplace
-    return () => mixer.removeEventListener('finished', onFinished)
-  }, [attack, actions, mixer])
-
-  /* ---------- Boucle frame-par-frame ---------- */
+  /* boucle frame */
   const { camera, size } = useThree()
-
-  useFrame(() => {
+  useFrame((_s, delta) => {
     if (!group.current) return
 
-    /* -- Déplacement joueur -- */
-    const { dx, dz, moving } = dirFromKeys(keys)
-    if (dx || dz) {
-      group.current.position.x += dx * SPEED
-      group.current.position.z += dz * SPEED
+    /* mouvement */
+    const { dx, dz, moving } = dir(keys)
+    if (!fall && (dx || dz)) {
+      const step = SPEED * delta
+      group.current.position.x += dx * step
+      group.current.position.z += dz * step
       group.current.rotation.y = Math.atan2(dx, dz)
     }
 
-    /* -- Animations hors attaque -- */
-    if (!attack) {
-      fadeTo(moving ? 'run' : 'idle')
+    /* saut */
+    if (jumpMeta.current) {
+      const { start, duration } = jumpMeta.current
+      const t = Math.min((performance.now() - start) / (duration * 1000), 1)
+      group.current.position.y = Math.sin(Math.PI * t) * JUMP_HEIGHT
+    } else if (!fall) {
+      group.current.position.y = 0
     }
 
-    /* -- Caméra ortho qui suit le joueur -- */
+    /* checkpoints */
+    CHECKPOINTS.forEach((arr, i) => {
+      if (i === currentCP) return
+      if (group.current.position.distanceTo(new Vector3(...arr)) < CP_RADIUS) {
+        setCurrentCP(i)
+        respawnPos.current.set(...arr)
+      }
+    })
+
+    /* détection hors-sol → chute */
+    if (
+      !fall &&
+      (Math.abs(group.current.position.x) > HALF_W ||
+        Math.abs(group.current.position.z) > HALF_D)
+    ) {
+      setFall(true)
+      fadeTo('fall')
+    }
+
+    /* chute */
+    if (fall) {
+      group.current.position.y -= GRAVITY * delta
+      if (group.current.position.y < FALL_Y_END) respawn()
+    }
+
+    /* anim run/idle */
+    if (!attack && !jump && !fall) fadeTo(moving ? 'run' : 'idle')
+
+    /* caméra */
     const ortho = camera as THREE.OrthographicCamera
     ortho.position.set(
       group.current.position.x + 10,
@@ -106,19 +163,15 @@ export default function Player() {
       group.current.position.z + 10,
     )
     ortho.lookAt(group.current.position)
-
-    /* -- Ajuste le frustum quand la fenêtre change -- */
     const aspect = size.width / size.height
-    ortho.left   = -FRUSTUM_SIZE * aspect / 2
-    ortho.right  =  FRUSTUM_SIZE * aspect / 2
-    ortho.top    =  FRUSTUM_SIZE / 2
+    ortho.left = (-FRUSTUM_SIZE * aspect) / 2
+    ortho.right = (FRUSTUM_SIZE * aspect) / 2
+    ortho.top = FRUSTUM_SIZE / 2
     ortho.bottom = -FRUSTUM_SIZE / 2
     ortho.updateProjectionMatrix()
   })
 
-  /* ---------- Affiche le modèle dans la scène ---------- */
-  return <primitive object={scene} ref={group} scale={1.5} />
+  return <primitive ref={group} object={scene} scale={1.5} />
 }
 
-/* Précharge le GLB pour éviter le “pop-in” */
 useGLTF.preload('/character.glb')

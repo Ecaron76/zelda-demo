@@ -20,7 +20,7 @@ export default function Ground() {
 
   return (
     <mesh rotation-x={-Math.PI / 2} receiveShadow>
-      <planeGeometry args={[20, 20, 64, 64]} />
+      <planeGeometry args={[60, 20, 64, 64]} />
       <meshStandardMaterial
         map={color}
         normalMap={normal}
