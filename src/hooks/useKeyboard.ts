@@ -3,11 +3,14 @@ import { useEffect, useState } from 'react'
 type Keys =
   | 'ArrowUp' | 'ArrowDown' | 'ArrowLeft' | 'ArrowRight'
   | 'z' | 's' | 'q' | 'd'
+  | ' '                // 👈 barre espace
 
 const ALL_KEYS: Keys[] = [
   'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight',
   'z', 's', 'q', 'd',
+  ' ',
 ]
+
 
 export function useKeyboard() {
   const [keys, setKeys] = useState<Record<Keys, boolean>>(
